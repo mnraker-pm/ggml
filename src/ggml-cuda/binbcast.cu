@@ -328,32 +328,31 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
         size_t s03 = nb03 / sizeof(src0_t);
 
         // Large tensors need 64-bit indices before any uint32 launch dimensions are formed.
-            const int64_t ne_total = ne0 * ne1 * ne2 * ne3;
-            const int64_t max_off_src0 = (ne3-1)*(int64_t)s03 + (ne2-1)*(int64_t)s02 +
-                                         (ne1-1)*(int64_t)s01 + (ne0-1)*(int64_t)s00;
-            const int64_t max_off_dst  = (ne3-1)*(int64_t)s3  + (ne2-1)*(int64_t)s2  +
-                                         (ne1-1)*(int64_t)s1  + (ne0-1);
-            const int64_t u32max = (int64_t) 0xFFFFFFFFll;
-            if (ne_total > u32max - 127 || max_off_src0 > u32max || max_off_dst > u32max ||
-                s00 > u32max || s01 > u32max || s02 > u32max || s03 > u32max ||
-                s10 > u32max || s11 > u32max || s12 > u32max || s13 > u32max ||
-                s1 > u32max || s2 > u32max || s3 > u32max) {
-                const int64_t want    = (ne_total + 128 - 1) / 128;
-                const int64_t nblocks = want < 65535 ? want : 65535;   // grid-stride covers the rest
-                const ggml_cuda_kernel_launch_params launch_params =
-                    ggml_cuda_kernel_launch_params((dim3) (uint32_t) nblocks, 128, 0, stream);
-                ggml_cuda_kernel_launch(
-                    k_bin_bcast_unravel_64<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>,
-                    launch_params, src0_dd, src1_dd, dst_dd,
-                    (int64_t) ne0, (int64_t) ne1, (int64_t) ne2, (int64_t) ne3,
-                    (int64_t) cne1[0], (int64_t) cne1[1], (int64_t) cne1[2], (int64_t) cne1[3],
-                    (int64_t) s1, (int64_t) s2, (int64_t) s3,
-                    (int64_t) s00, (int64_t) s01, (int64_t) s02, (int64_t) s03,
-                    (int64_t) s10, (int64_t) s11, (int64_t) s12, (int64_t) s13,
-                    ne_total, (const src1_t *) dst->src[I + 1]->data...);
-                return;
-            }
-
+        const int64_t ne_total = ne0 * ne1 * ne2 * ne3;
+        const int64_t max_off_src0 = (ne3-1)*(int64_t)s03 + (ne2-1)*(int64_t)s02 +
+                                     (ne1-1)*(int64_t)s01 + (ne0-1)*(int64_t)s00;
+        const int64_t max_off_dst  = (ne3-1)*(int64_t)s3  + (ne2-1)*(int64_t)s2  +
+                                     (ne1-1)*(int64_t)s1  + (ne0-1);
+        const int64_t u32max = (int64_t) 0xFFFFFFFFll;
+        if (ne_total > u32max - 127 || max_off_src0 > u32max || max_off_dst > u32max ||
+            s00 > u32max || s01 > u32max || s02 > u32max || s03 > u32max ||
+            s10 > u32max || s11 > u32max || s12 > u32max || s13 > u32max ||
+            s1 > u32max || s2 > u32max || s3 > u32max) {
+            const int64_t want    = (ne_total + 128 - 1) / 128;
+            const int64_t nblocks = want < 65535 ? want : 65535;   // grid-stride covers the rest
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params((dim3) (uint32_t) nblocks, 128, 0, stream);
+            ggml_cuda_kernel_launch(
+                k_bin_bcast_unravel_64<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>,
+                launch_params, src0_dd, src1_dd, dst_dd,
+                (int64_t) ne0, (int64_t) ne1, (int64_t) ne2, (int64_t) ne3,
+                (int64_t) cne1[0], (int64_t) cne1[1], (int64_t) cne1[2], (int64_t) cne1[3],
+                (int64_t) s1, (int64_t) s2, (int64_t) s3,
+                (int64_t) s00, (int64_t) s01, (int64_t) s02, (int64_t) s03,
+                (int64_t) s10, (int64_t) s11, (int64_t) s12, (int64_t) s13,
+                ne_total, (const src1_t *) dst->src[I + 1]->data...);
+            return;
+        }
 
         GGML_ASSERT(ne0 <= std::numeric_limits<uint32_t>::max());
         GGML_ASSERT(ne1 <= std::numeric_limits<uint32_t>::max());
