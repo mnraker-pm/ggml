@@ -729,7 +729,6 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     if (getenv("GGML_FA_DEBUG")) {
         const char * kname = best_k == BEST_FATTN_KERNEL_TILE ? "TILE"
                            : best_k == BEST_FATTN_KERNEL_VEC  ? "VEC"
-                           : best_k == BEST_FATTN_KERNEL_WMMA_F16 ? "WMMA_F16"
                            : best_k == BEST_FATTN_KERNEL_MMA_F16  ? "MMA_F16" : "NONE";
         const ggml_tensor * Q = dst->src[0], * K = dst->src[1], * V = dst->src[2];
         fprintf(stderr, "[fa] kernel=%s prec=%s Q=[%lld,%lld,%lld] K=[%lld,%lld,%lld] Ktype=%s Vtype=%s mask=%s\n",
