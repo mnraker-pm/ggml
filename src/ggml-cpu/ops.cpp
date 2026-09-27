@@ -2,6 +2,7 @@
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "binary-ops.h"
 #include "simd-gemm.h"
 #include "ggml.h"
@@ -11,6 +12,32 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+
+struct ggml_fp8_e4m3_cpu {
+    uint8_t value;
+};
+
+struct ggml_fp8_e5m2_cpu {
+    uint8_t value;
+};
+
+static float fp8_e4m3_to_f32(ggml_fp8_e4m3_cpu value) {
+    return ggml_fp8_e4m3_to_fp32(value.value);
+}
+
+static float fp8_e5m2_to_f32(ggml_fp8_e5m2_cpu value) {
+    return ggml_fp8_e5m2_to_fp32(value.value);
+}
+
+template<>
+struct type_conversion_table<ggml_fp8_e4m3_cpu> {
+    static constexpr float (*to_f32)(ggml_fp8_e4m3_cpu) = fp8_e4m3_to_f32;
+};
+
+template<>
+struct type_conversion_table<ggml_fp8_e5m2_cpu> {
+    static constexpr float (*to_f32)(ggml_fp8_e5m2_cpu) = fp8_e5m2_to_f32;
+};
 
 // ggml_compute_forward_dup
 
@@ -541,6 +568,20 @@ void ggml_compute_forward_dup(
                 else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp16_t, ggml_bf16_t>(params, dst);
                 else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp16_t, float      >(params, dst);
                 else ggml_compute_forward_dup_to_q<ggml_fp16_t>(params, dst);
+            } break;
+        case GGML_TYPE_F8_E4M3:
+            {
+                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, ggml_fp16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, ggml_bf16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp8_e4m3_cpu, float>(params, dst);
+                else GGML_ABORT("unsupported FP8 E4M3 conversion");
+            } break;
+        case GGML_TYPE_F8_E5M2:
+            {
+                /**/ if (dst->type == GGML_TYPE_F16)  ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, ggml_fp16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_BF16) ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, ggml_bf16_t>(params, dst);
+                else if (dst->type == GGML_TYPE_F32)  ggml_compute_forward_dup_flt<ggml_fp8_e5m2_cpu, float>(params, dst);
+                else GGML_ABORT("unsupported FP8 E5M2 conversion");
             } break;
         case GGML_TYPE_BF16:
             {
@@ -12202,5 +12243,98 @@ void ggml_compute_forward_lightning_indexer(
                 dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
             }
         }
+    }
+}
+
+void ggml_compute_forward_quantize_i8_convrot(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+
+    GGML_ASSERT(src->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I8);
+    GGML_ASSERT(ggml_is_contiguous(src));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int group_size = ggml_get_op_params_i32(dst, 0);
+    const int64_t k      = src->ne[0];
+    const int64_t rows   = ggml_nrows(src);
+    const int64_t rows_padded = GGML_PAD(rows, 4);
+    const int64_t scale_rows  = (rows * (int64_t)sizeof(float) + k - 1) / k;
+    GGML_ASSERT(group_size > 0 && group_size <= 256 && k % group_size == 0);
+    GGML_ASSERT(dst->ne[0] == k && dst->ne[1] == rows_padded + scale_rows);
+
+    const float * src_data = (const float *)src->data;
+    char * dst_data        = (char *)dst->data;
+    float * dst_scales     = (float *)(dst_data + k * rows_padded);
+    const float transform_scale = 1.0f / sqrtf((float)group_size);
+
+    for (int64_t row = params->ith; row < rows; row += params->nth) {
+        const float * src_row = src_data + row * k;
+        int8_t * dst_row      = (int8_t *)(dst_data + row * dst->nb[1]);
+        float amax            = 0.0f;
+        float values[256];
+
+        for (int64_t group = 0; group < k; group += group_size) {
+            for (int i = 0; i < group_size; ++i) {
+                values[i] = src_row[group + i] * transform_scale;
+            }
+            for (int stride = 1; stride < group_size; stride *= 4) {
+                for (int base = 0; base < group_size; base += 4 * stride) {
+                    for (int j = 0; j < stride; ++j) {
+                        const int i0 = base + j;
+                        const int i1 = i0 + stride;
+                        const int i2 = i1 + stride;
+                        const int i3 = i2 + stride;
+                        const float a = values[i0];
+                        const float b = values[i1];
+                        const float c = values[i2];
+                        const float d = values[i3];
+                        values[i0] =  a + b + c - d;
+                        values[i1] =  a + b - c + d;
+                        values[i2] =  a - b + c + d;
+                        values[i3] = -a + b + c + d;
+                    }
+                }
+            }
+            for (int i = 0; i < group_size; ++i) {
+                amax = MAX(amax, fabsf(values[i]));
+            }
+        }
+
+        const float row_scale = amax / 127.0f;
+        const float inv_scale = row_scale == 0.0f ? 0.0f : 1.0f / row_scale;
+        dst_scales[row] = row_scale;
+
+        for (int64_t group = 0; group < k; group += group_size) {
+            for (int i = 0; i < group_size; ++i) {
+                values[i] = src_row[group + i] * transform_scale;
+            }
+            for (int stride = 1; stride < group_size; stride *= 4) {
+                for (int base = 0; base < group_size; base += 4 * stride) {
+                    for (int j = 0; j < stride; ++j) {
+                        const int i0 = base + j;
+                        const int i1 = i0 + stride;
+                        const int i2 = i1 + stride;
+                        const int i3 = i2 + stride;
+                        const float a = values[i0];
+                        const float b = values[i1];
+                        const float c = values[i2];
+                        const float d = values[i3];
+                        values[i0] =  a + b + c - d;
+                        values[i1] =  a + b - c + d;
+                        values[i2] =  a - b + c + d;
+                        values[i3] = -a + b + c + d;
+                    }
+                }
+            }
+            for (int i = 0; i < group_size; ++i) {
+                int value = row_scale == 0.0f ? 0 : (int)lrintf(values[i] * inv_scale);
+                value = MAX(-127, MIN(127, value));
+                dst_row[group + i] = (int8_t)value;
+            }
+        }
+    }
+
+    if (params->ith == 0 && rows_padded > rows) {
+        memset(dst_data + rows * dst->nb[1], 0, (size_t)(rows_padded - rows) * dst->nb[1]);
     }
 }

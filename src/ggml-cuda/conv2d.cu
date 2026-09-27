@@ -137,7 +137,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     constexpr int BS = BN / 2 + 4;
     __shared__ __align__(16) half2 a_s[BM][AS];
     __shared__ __align__(16) half2 b_s[BK][BS];
-
     const int tid = threadIdx.y * warp_size + threadIdx.x;
     const int iw = int(P.IW), ih = int(P.IH), ow = int(P.OW), oh = int(P.OH);
     const int kw = KW ? KW : int(P.KW), kh = KH ? KH : int(P.KH);
@@ -146,7 +145,6 @@ static __global__ void conv2d_implicit_gemm_f16(const half * __restrict__ input,
     const int dx = int(P.DL_X), dy = int(P.DL_Y);
     const int n = blockIdx.z / split_k, split = blockIdx.z % split_k;
     const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-
     const int k_total   = ic * kw * kh;
     const int load_lane = warp_size == 32 ? threadIdx.x : threadIdx.x % (BN / 2);
     const int load_row  = threadIdx.y * (warp_size / (BN / 2)) + (warp_size == 32 ? 0 : threadIdx.x / (BN / 2));
@@ -372,8 +370,67 @@ void ggml_cuda_op_conv2d(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t OC = kernel->ne[3];  // ouptut_chanles
     const int64_t B  = input->ne[3];   // n_batches
 
-    const int64_t total  = B * OC * OH * OW;
-    conv_params   params = { IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total };
+    const int64_t total = B * OC * OH * OW;
+    conv_params params  = {IW, IH, OW, OH, KW, KH, ST_X, ST_Y, PD_X, PD_Y, DL_X, DL_Y, IC, OC, B, total};
+
+    const auto & device = ggml_cuda_info().devices[ctx.device];
+    const bool use_mma   = turing_mma_available(device.cc) || amd_wmma_available(device.cc) || amd_mfma_available(device.cc);
+    // MUSA can share the tiling without a native fragment implementation in mma.cuh.
+    const bool use_simt    = GGML_CUDA_CC_IS_MTHREADS(device.cc);
+    const bool pointwise  = KW == 1 && KH == 1 && ST_X == 1 && ST_Y == 1 && PD_X == 0 && PD_Y == 0;
+    const bool use_blas    = pointwise && fast_fp16_hardware_available(device.cc);
+    const int64_t limit    = INT_MAX - 256;
+    const int64_t padded_w = IW + 2 * int64_t(PD_X), padded_h = IH + 2 * int64_t(PD_Y);
+    const bool padded_fits = padded_w > 0 && padded_w <= limit && padded_h > 0 && padded_h <= limit &&
+                             padded_w * padded_h <= limit && IC * B <= limit / (padded_w * padded_h);
+    if (kernel->type == GGML_TYPE_F16 && (use_mma || use_blas || use_simt) &&
+        ggml_nelements(input) <= limit && ggml_nelements(kernel) <= limit && total <= limit && padded_fits &&
+        PD_X >= 0 && PD_Y >= 0 && ST_X > 0 && ST_Y > 0 && DL_X > 0 && DL_Y > 0 &&
+        (OW - 1) * ST_X + (KW - 1) * DL_X < padded_w && (OH - 1) * ST_Y + (KH - 1) * DL_Y < padded_h &&
+        (OC + 63) / 64 <= 65535 && B <= 65535) {
+        const int pw = int(padded_w), ph = int(padded_h);
+        const int padded_total = int(padded_w * padded_h * IC * B);
+        ggml_cuda_pool_alloc<half> x_half(ctx.pool(), padded_total);
+        // Match im2col's F16 input precision, but expand patches only in shared memory and accumulate in F32.
+        if (PD_X == 0 && PD_Y == 0) {
+            ggml_get_to_fp16_cuda(input->type)(X_D, x_half.get(), padded_total, st);
+        } else {
+            conv2d_pad_f16<<<(padded_total + 255) / 256, 256, 0, st>>>(X_D, x_half.get(), int(IW), int(IH), pw, ph, PD_X, PD_Y, padded_total);
+        }
+        const conv_params padded_params = {pw, ph, OW, OH, KW, KH, ST_X, ST_Y, 0, 0, DL_X, DL_Y, IC, OC, B, total};
+        if (use_blas) {
+            const float alpha = 1.0f, beta = 0.0f;
+            const int positions = int(OW * OH);
+            CUBLAS_CHECK(cublasSetStream(ctx.cublas_handle(), st));
+            for (int n = 0; n < B; ++n) {
+                CUBLAS_CHECK(cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N,
+                                          positions, int(OC), int(IC), &alpha,
+                                          x_half.get() + int64_t(n) * IC * positions, CUDA_R_16F, positions,
+                                          K_D, CUDA_R_16F, int(IC), &beta,
+                                          Y_D + int64_t(n) * OC * positions, CUDA_R_32F, positions,
+                                          CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+            }
+            return;
+        }
+        const int64_t blocks = ((OW * OH + 63) / 64) * ((OC + 63) / 64) * B;
+        const int target     = 8 * ggml_cuda_info().devices[ctx.device].nsm;
+        // Split long reductions so small spatial maps still occupy the GPU.
+        const int split_k = int(std::min({int64_t(32), int64_t(65535) / B, (IC * KW * KH + 63) / 64,
+                                          std::max(int64_t(1), (target + blocks - 1) / blocks)}));
+        ggml_cuda_pool_alloc<float> partial(ctx.pool());
+        float* result = split_k == 1 ? Y_D : partial.alloc(total * split_k);
+        const dim3 block(device.warp_size, 4);
+        const dim3 grid(unsigned((OW * OH + 63) / 64), unsigned((OC + 63) / 64), unsigned(B * split_k));
+        if (use_mma) {
+            conv2d_launch_implicit_gemm<true>(x_half.get(), (const half*)K_D, result, padded_params, split_k, grid, block, st);
+        } else {
+            conv2d_launch_implicit_gemm<false>(x_half.get(), (const half*)K_D, result, padded_params, split_k, grid, block, st);
+        }
+        if (split_k > 1) {
+            conv2d_reduce_split_k<<<(total + 255) / 256, 256, 0, st>>>(result, Y_D, int(total), int(OC * OW * OH), split_k);
+        }
+        return;
+    }
 
     const auto & device = ggml_cuda_info().devices[ctx.device];
     const bool   use_mma =
